@@ -19,8 +19,22 @@ fn pop(cpu: ptr<function, VCPU>) -> i32 {
     return (*cpu).stack[sp];
 }
 
-// Template Operations
+// Helper to check ownership (Read)
+fn get_owner(addr: i32) -> i32 {
+    return atomicLoad(&ownership[mo(addr, uniforms.SOUP_SIZE)]);
+}
 
+fn update_health(cpu: ptr<function, VCPU>, cell: ptr<function, Cell>) {
+    // Increment age
+    (*cell).age += 1;
+
+    // Increment errors if the CPU flag is set
+    if ((*cpu).flags[0] != 0) {
+        (*cell).errors += 1;
+    }
+}
+
+// Template Operations
 // get template size following the start_ip instructions
 fn get_template_size(start_ip: i32, soup_size: i32) -> i32 {
     var size = 0;
