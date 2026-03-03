@@ -24,6 +24,21 @@ fn get_owner(addr: i32) -> i32 {
     return atomicLoad(&ownership[mo(addr, uniforms.SOUP_SIZE)]);
 }
 
+// Update S (sign) and Z (zero) flags after a math/logic operation.
+// Mirrors DoFlags() in the original instruct.c.
+fn do_flags(cpu: ptr<function, VCPU>, result: i32) {
+    (*cpu).flags[1] = select(0, 1, result < 0);  // S: sign
+    (*cpu).flags[2] = select(0, 1, result == 0); // Z: zero
+}
+
+// Apply range constraint for C/D registers: if |val| > limit, return 0.
+// Mirrors the DoMods() dran branch in the original instruct.c.
+// A/B registers use mo() instead (address modulus).
+fn apply_range(val: i32, limit: i32) -> i32 {
+    if (val > limit || val < -limit) { return 0; }
+    return val;
+}
+
 fn update_health(cpu: ptr<function, VCPU>, cell: ptr<function, Cell>) {
     // Increment age
     (*cell).age += 1;

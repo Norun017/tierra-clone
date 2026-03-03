@@ -75,27 +75,69 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let t_size = get_template_size(ip, SOUP_SIZE);
     var ip_modified = false;
 
-    // 4. Decode & Execute (Example: incA)
+    // Clear error flag from previous cycle so errors don't bleed across instructions.
+    // Instructions that genuinely fail will set flags[0] = 1 themselves.
+    cpu.flags[0] = 0;
+
+    // 4. Decode & Execute
     switch (opcode) {
         // --- NOPS ---
         case 0x00, 0x01: { /* nop0, nop1: Do nothing */ }
-        
+
         // --- MATH & LOGIC ---
-        case 0x02: { cpu.registers[2] ^= 1; } // not0: Flip bit 0 of CX
-        case 0x03: { cpu.registers[2] <<= 1; } // shl: Shift CX left
-        case 0x04: { cpu.registers[2] = 0; } // zero: CX = 0
+        // A/B registers are addresses → constrained with mo() (modulus SOUP_SIZE).
+        // C/D registers are counts  → constrained with apply_range() (zero if overflow).
+        // All math ops update S and Z flags via do_flags().
+        case 0x02: { // not0: CX ^= 1
+            let r = apply_range(cpu.registers[2] ^ 1, SOUP_SIZE);
+            cpu.registers[2] = r;
+            do_flags(&cpu, r);
+        }
+        case 0x03: { // shl: CX <<= 1
+            let r = apply_range(cpu.registers[2] << 1, SOUP_SIZE);
+            cpu.registers[2] = r;
+            do_flags(&cpu, r);
+        }
+        case 0x04: { // zero: CX = 0
+            cpu.registers[2] = 0;
+            do_flags(&cpu, 0);
+        }
         case 0x05: { // ifz: If CX != 0, skip the next instruction (and its template)
             if (cpu.registers[2] != 0) {
                 let next_t_size = get_template_size(mo(cpu.ip + 1, SOUP_SIZE), SOUP_SIZE);
                 cpu.ip = mo(cpu.ip + 1 + next_t_size, SOUP_SIZE);
             }
         }
-        case 0x06: { cpu.registers[2] = cpu.registers[0] - cpu.registers[1]; } // subCAB: CX = AX - BX
-        case 0x07: { cpu.registers[0] = cpu.registers[0] - cpu.registers[2]; } // subAAC: AX = AX - CX
-        case 0x08: { cpu.registers[0] += 1; } // incA: AX++
-        case 0x09: { cpu.registers[1] += 1; } // incB: BX++
-        case 0x0a: { cpu.registers[2] -= 1; } // decC: CX--
-        case 0x0b: { cpu.registers[2] += 1; } // incC: CX++
+        case 0x06: { // subCAB: CX = AX - BX
+            let r = apply_range(cpu.registers[0] - cpu.registers[1], SOUP_SIZE);
+            cpu.registers[2] = r;
+            do_flags(&cpu, r);
+        }
+        case 0x07: { // subAAC: AX = AX - CX  (AX is an address → modulus)
+            let r = mo(cpu.registers[0] - cpu.registers[2], SOUP_SIZE);
+            cpu.registers[0] = r;
+            do_flags(&cpu, r);
+        }
+        case 0x08: { // incA: AX++  (address → modulus)
+            let r = mo(cpu.registers[0] + 1, SOUP_SIZE);
+            cpu.registers[0] = r;
+            do_flags(&cpu, r);
+        }
+        case 0x09: { // incB: BX++  (address → modulus)
+            let r = mo(cpu.registers[1] + 1, SOUP_SIZE);
+            cpu.registers[1] = r;
+            do_flags(&cpu, r);
+        }
+        case 0x0a: { // decC: CX--
+            let r = apply_range(cpu.registers[2] - 1, SOUP_SIZE);
+            cpu.registers[2] = r;
+            do_flags(&cpu, r);
+        }
+        case 0x0b: { // incC: CX++
+            let r = apply_range(cpu.registers[2] + 1, SOUP_SIZE);
+            cpu.registers[2] = r;
+            do_flags(&cpu, r);
+        }
 
         // --- STACK ---
         case 0x0c: { push(&cpu, cpu.registers[0]); } // pushA

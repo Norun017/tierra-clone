@@ -183,18 +183,6 @@ device.queue.writeBuffer(statsBuffer, 0, statData);
 
 // Staging buffer
 
-const cpuStagingBuffer = device.createBuffer({
-  label: "CPU_STAGING_BUFFER",
-  size: cpuBuffer.size,
-  usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
-});
-
-const cellStagingBuffer = device.createBuffer({
-  label: "CELL_STAGING_BUFFER",
-  size: cellBuffer.size,
-  usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
-});
-
 const statsStagingBuffer = device.createBuffer({
   label: "STATS_STAGING_BUFFER",
   size: 16,
@@ -276,33 +264,41 @@ const computeBindGroup = device.createBindGroup({
   ],
 });
 
-const computePassDescriptor: GPUComputePassDescriptor = {};
+// How many GPU ticks to advance per visual frame. Raise for faster simulation,
+// lower if the browser stutters. 50 ≈ 3000 cycles/sec at 60 fps.
+const TICKS_PER_FRAME = 50;
 
-async function cycle() {
+// Pure GPU dispatch — no readback, no await. Submits one simulation step.
+function tick() {
   const commandEncoder = device.createCommandEncoder();
   const computePass = commandEncoder.beginComputePass();
-
   computePass.setPipeline(pipeline);
   computePass.setBindGroup(0, computeBindGroup);
-
   computePass.dispatchWorkgroups(64);
   computePass.end();
+  device.queue.submit([commandEncoder.finish()]);
+  cycleCount++;
+}
 
-  //Copy data from buffer in GPU so that CPU can read
-  commandEncoder.copyBufferToBuffer(
-    cpuBuffer,
-    0,
-    cpuStagingBuffer,
-    0,
-    cpuBuffer.size,
-  );
-  commandEncoder.copyBufferToBuffer(
-    cellBuffer,
-    0,
-    cellStagingBuffer,
-    0,
-    cellBuffer.size,
-  );
+// ================== Run Sims ================
+let isRunning = true;
+let cycleCount = 0;
+const cycles = 100000;
+
+// Called once per display refresh (~60 fps). Runs TICKS_PER_FRAME simulation
+// steps, then does a single GPU→CPU readback for only the data the canvas
+// and dashboard actually need (ownership + soup + stats).
+// cpuBuffer / cellBuffer are left on the GPU — no wasted transfer.
+async function renderFrame() {
+  if (!isRunning) return;
+
+  for (let i = 0; i < TICKS_PER_FRAME && cycleCount < cycles; i++) {
+    tick();
+  }
+  if (cycleCount >= cycles) isRunning = false;
+
+  // Single readback for visualization — only 3 buffers instead of 5
+  const commandEncoder = device.createCommandEncoder();
   commandEncoder.copyBufferToBuffer(statsBuffer, 0, statsStagingBuffer, 0, 16);
   commandEncoder.copyBufferToBuffer(
     ownershipBuffer,
@@ -318,25 +314,14 @@ async function cycle() {
     0,
     soupBuffer.size,
   );
-
   device.queue.submit([commandEncoder.finish()]);
 
-  // Read results back to CPU
   await Promise.all([
-    cpuStagingBuffer.mapAsync(GPUMapMode.READ),
-    cellStagingBuffer.mapAsync(GPUMapMode.READ),
     statsStagingBuffer.mapAsync(GPUMapMode.READ),
     ownershipStagingBuffer.mapAsync(GPUMapMode.READ),
     soupStagingBuffer.mapAsync(GPUMapMode.READ),
   ]);
 
-  // Create JavaScript-owned copies
-  const cpuRes = new Int32Array(
-    cpuStagingBuffer.getMappedRange(0, cpuBuffer.size).slice(0),
-  );
-  const cellRes = new Int32Array(
-    cellStagingBuffer.getMappedRange(0, cellBuffer.size).slice(0),
-  );
   const statsRes = new Int32Array(
     statsStagingBuffer.getMappedRange(0, statsBuffer.size).slice(0),
   );
@@ -347,10 +332,6 @@ async function cycle() {
     soupStagingBuffer.getMappedRange(0, soupBuffer.size).slice(0),
   );
 
-  // Record CPU 0 (The Ancestor or its lineage)
-  //reporter.appendCycle(cycleCount, 0, cpuRes, soupRes);
-
-  // Update UI
   document.getElementById("stat-cycle")!.innerText = cycleCount.toString();
   document.getElementById("stat-pop")!.innerText = statsRes[0].toString();
   document.getElementById("stat-mem")!.innerText = statsRes[1].toString();
@@ -359,33 +340,16 @@ async function cycle() {
     100
   ).toFixed(2);
 
-  // Draw the visuals
   drawSoup(ownershipRes, soupRes);
 
-  cpuStagingBuffer.unmap();
-  cellStagingBuffer.unmap();
   statsStagingBuffer.unmap();
   ownershipStagingBuffer.unmap();
   soupStagingBuffer.unmap();
+
+  if (isRunning) requestAnimationFrame(renderFrame);
 }
 
-// ================== Run Sims ================
-let isRunning = true;
-let cycleCount = 0;
-const cycles = 100000;
-
-async function runSimulation() {
-  while (isRunning && cycleCount < cycles) {
-    // Await the entire cycle to finish before starting the next one
-    await cycle();
-    cycleCount++;
-
-    // Optional: add a small delay so it doesn't max out your GPU instantly
-    await new Promise((resolve) => setTimeout(resolve, 1));
-  }
-}
-
-runSimulation();
+requestAnimationFrame(renderFrame);
 
 // ============== Get Data from GPU ===================
 /**
