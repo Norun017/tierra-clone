@@ -7,7 +7,6 @@ import {
   MAX_ORGANISMS,
   FIELDS_PER_CELL,
   FIELDS_PER_CPU,
-  OP_NAMES,
 } from "./constants";
 import {
   initMonitor,

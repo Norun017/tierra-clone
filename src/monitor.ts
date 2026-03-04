@@ -356,7 +356,7 @@ export function tickCensus(
 
 // ============== Debug Report ==============
 
-class SimulationReport {
+/* class SimulationReport {
   private log = "Cycle,CPU_Idx,IP,Instruction,AX,BX,CX,DX,ErrorFlag\n";
 
   appendCycle(
@@ -385,4 +385,4 @@ class SimulationReport {
     a.click();
     URL.revokeObjectURL(url);
   }
-}
+} */
