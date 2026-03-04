@@ -353,3 +353,36 @@ export function tickCensus(
     runCensus(cellRes, soupRes, cycleCount);
   }
 }
+
+// ============== Debug Report ==============
+
+class SimulationReport {
+  private log = "Cycle,CPU_Idx,IP,Instruction,AX,BX,CX,DX,ErrorFlag\n";
+
+  appendCycle(
+    cycle: number,
+    cpuIdx: number,
+    cpuData: Int32Array,
+    soupData: Int32Array,
+  ) {
+    const offset = cpuIdx * FIELDS_PER_CPU;
+    if (cpuData[offset + 20] === 0) return;
+
+    const ip = cpuData[offset + 4];
+    const regs = cpuData.subarray(offset + 0, offset + 4);
+    const errorFlag = cpuData[offset + 16];
+    const opcode = soupData[((ip % SOUP_SIZE) + SOUP_SIZE) % SOUP_SIZE] % 32;
+
+    this.log += `${cycle},${cpuIdx},${ip},${OP_NAMES[opcode] ?? "???"},${regs[0]},${regs[1]},${regs[2]},${regs[3]},${errorFlag}\n`;
+  }
+
+  download() {
+    const blob = new Blob([this.log], { type: "text/csv" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `tierra_report_${Date.now()}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+}
