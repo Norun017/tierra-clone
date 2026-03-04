@@ -51,6 +51,8 @@ struct VCPU {
 @group(0) @binding(3) var<storage, read_write> vCPUs: array<VCPU>;
 @group(0) @binding(4) var<storage, read_write> cells: array<Cell>;
 @group(0) @binding(5) var<storage, read_write> stats: GlobalStats;
+@group(0) @binding(6) var<storage, read_write> cell_locks: array<atomic<i32>>;
+@group(0) @binding(7) var<storage, read_write> cpu_locks: array<atomic<i32>>;
 
 
 @compute @workgroup_size(64)
@@ -258,6 +260,13 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     // Save state back to global buffer
     vCPUs[cpu_index] = cpu;
     cells[cpu.cell_index] = cell; // Save cell back in case CPU modified it (like allocating daughter mem)
+
+    // Release CPU slot lock when this thread dies so divide() can reuse the slot.
+    // (Cell lock is released inside kill_cell; CPU lock must be released here
+    //  because kill_cell doesn't know the cpu_index into the vCPUs array.)
+    if (cpu.state == 0) {
+        atomicStore(&cpu_locks[cpu_index], 0);
+    }
 }
 
 fn mal(cpu: ptr<function, VCPU>, cell: ptr<function, Cell>) {
@@ -369,21 +378,28 @@ fn divide(cpu: ptr<function, VCPU>, cell: ptr<function, Cell>) {
         return;
     }
 
-    // --- 2. FIND RESOURCES ---
+    // --- 2. FIND RESOURCES (race-free with atomic CAS) ---
+    // Claim a free cell slot atomically (0 → 1). Only one thread wins per slot.
     var d_idx: i32 = -1;
     for (var i: u32 = 0u; i < MAX_CELLS; i++) {
-        if (cells[i].state == 0) { 
-            d_idx = i32(i); 
-            break; 
+        if (cells[i].state == 0) {
+            let cas = atomicCompareExchangeWeak(&cell_locks[i], 0, 1);
+            if (cas.exchanged) {
+                d_idx = i32(i);
+                break;
+            }
         }
     }
 
-    // Find a CPU for the daughter
+    // Claim a free CPU slot atomically (0 → 1). Only one thread wins per slot.
     var d_cpu_idx: i32 = -1;
     for (var j: u32 = 0u; j < arrayLength(&vCPUs); j++) {
-        if (vCPUs[j].state == 0) { 
-            d_cpu_idx = i32(j); 
-            break; 
+        if (vCPUs[j].state == 0) {
+            let cas = atomicCompareExchangeWeak(&cpu_locks[j], 0, 1);
+            if (cas.exchanged) {
+                d_cpu_idx = i32(j);
+                break;
+            }
         }
     }
 
@@ -421,6 +437,9 @@ fn divide(cpu: ptr<function, VCPU>, cell: ptr<function, Cell>) {
 
         atomicAdd(&stats.cells_alive, 1); // add cells alive to global stats
     } else {
+        // Release any partially-claimed locks so another thread can reuse the slot
+        if (d_idx != -1) { atomicStore(&cell_locks[u32(d_idx)], 0); }
+        if (d_cpu_idx != -1) { atomicStore(&cpu_locks[u32(d_cpu_idx)], 0); }
         (*cpu).flags[0] = 1; // Resource exhaustion
     }
 }
@@ -432,14 +451,14 @@ fn reap_check(cpu: ptr<function, VCPU>, cell: ptr<function, Cell>) {
     let fullness = mem_used / f32(SOUP_SIZE);
 
     // Only activate Reaper if soup is > 80% full
-    if (fullness > 0.80) {
+    if (fullness > 0.90) {
         // Calculate death score with a touch of randomness (using IP as a seed)
         let noise = i32(fract(sin(f32((*cpu).ip)) * 43758.5453) * 50.0);
         let death_score = (*cell).age + ((*cell).errors * 10) + noise;
 
         // The more full the soup, the lower the 'death_threshold' becomes
         // This creates "pressure"
-        let death_threshold = 2000 - i32(fullness * 1000.0);
+        let death_threshold = 3000 - i32(fullness * 1000.0);
 
         if (death_score > death_threshold) {
             kill_cell(cpu, cell);
@@ -470,7 +489,8 @@ fn kill_cell(cpu: ptr<function, VCPU>, cell: ptr<function, Cell>) {
     atomicAdd(&stats.cells_alive, -1);
     atomicAdd(&stats.memory_used, -(*cell).mem_size);
 
-    // 4. Set state to Dead
+    // 4. Release cell slot lock and set state to Dead
+    atomicStore(&cell_locks[u32((*cpu).cell_index)], 0);
     (*cell).state = 0;
     (*cpu).state = 0;
 }

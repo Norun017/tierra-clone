@@ -30,7 +30,11 @@ interface ICPU {
 
 document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
   <div style="display: flex; gap: 20px; font-family: monospace; background: #222; color: #0f0; padding: 20px;">
-    <canvas id="monitor" width="600" height="600" style="border: 1px solid #555;"></canvas>
+    <div style="display: flex; flex-direction: column; gap: 10px;">
+      <canvas id="monitor" width="600" height="600" style="border: 1px solid #555;"></canvas>
+      <canvas id="timeline" width="600" height="150" style="border: 1px solid #555;"></canvas>
+      <canvas id="histogram" width="600" height="120" style="border: 1px solid #555;"></canvas>
+    </div>
     <div id="dashboard">
       <h2>TIERRA MONITOR</h2>
       <p>Cycle: <span id="stat-cycle">0</span></p>
@@ -40,10 +44,21 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
       <hr>
       <h3>Top Organisms</h3>
       <div id="cell-list"></div>
+      <hr>
+      <h3>Genotype Census</h3>
+      <p style="font-size:11px">Live/Total: <span id="stat-genotypes">—</span></p>
+      <p style="font-size:11px">Genebank: <span id="stat-genebank">0</span>
+        <button id="genebankBtn" style="font-family:monospace;font-size:10px;background:#333;color:#0f0;border:1px solid #555;padding:1px 5px;cursor:pointer">↓ save</button>
+      </p>
+      <div id="census-list" style="font-size:11px;line-height:1.6;margin-top:4px"></div>
     </div>
   </div>
   <canvas id="canvas"></canvas>
 `;
+
+const timelineCanvas = document.querySelector<HTMLCanvasElement>("#timeline")!;
+const histogramCanvas =
+  document.querySelector<HTMLCanvasElement>("#histogram")!;
 
 const monitorCanvas = document.querySelector<HTMLCanvasElement>("#monitor")!;
 const canvas = document.querySelector<HTMLCanvasElement>("#canvas");
@@ -181,6 +196,24 @@ device.queue.writeBuffer(cpuBuffer, 0, cpuData);
 device.queue.writeBuffer(cellBuffer, 0, cellData);
 device.queue.writeBuffer(statsBuffer, 0, statData);
 
+// Slot lock buffers: one atomic<i32> per organism slot.
+// 0 = free, 1 = occupied. Used by divide() to claim slots without races.
+const cellLocksData = new Uint32Array(MAX_ORGANISMS);
+cellLocksData[0] = 1; // Cell 0 (ancestor) is already occupied
+const cpuLocksData = new Uint32Array(MAX_ORGANISMS);
+cpuLocksData[0] = 1; // CPU 0 (ancestor) is already occupied
+
+const cellLocksBuffer = device.createBuffer({
+  size: cellLocksData.byteLength,
+  usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+});
+const cpuLocksBuffer = device.createBuffer({
+  size: cpuLocksData.byteLength,
+  usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+});
+device.queue.writeBuffer(cellLocksBuffer, 0, cellLocksData);
+device.queue.writeBuffer(cpuLocksBuffer, 0, cpuLocksData);
+
 // Staging buffer
 
 const statsStagingBuffer = device.createBuffer({
@@ -198,6 +231,12 @@ const ownershipStagingBuffer = device.createBuffer({
 const soupStagingBuffer = device.createBuffer({
   label: "SOUP_STAGING_BUFFER",
   size: soupBuffer.size,
+  usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+});
+
+const cellStagingBuffer = device.createBuffer({
+  label: "CELL_STAGING_BUFFER",
+  size: cellBuffer.size,
   usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
 });
 
@@ -234,6 +273,16 @@ const bindGroupLayout = device.createBindGroupLayout({
       visibility: GPUShaderStage.COMPUTE,
       buffer: { type: "storage" },
     },
+    {
+      binding: 6,
+      visibility: GPUShaderStage.COMPUTE,
+      buffer: { type: "storage" },
+    },
+    {
+      binding: 7,
+      visibility: GPUShaderStage.COMPUTE,
+      buffer: { type: "storage" },
+    },
   ],
 });
 
@@ -261,12 +310,14 @@ const computeBindGroup = device.createBindGroup({
     { binding: 3, resource: cpuBuffer },
     { binding: 4, resource: cellBuffer },
     { binding: 5, resource: statsBuffer },
+    { binding: 6, resource: { buffer: cellLocksBuffer } },
+    { binding: 7, resource: { buffer: cpuLocksBuffer } },
   ],
 });
 
 // How many GPU ticks to advance per visual frame. Raise for faster simulation,
 // lower if the browser stutters. 50 ≈ 3000 cycles/sec at 60 fps.
-const TICKS_PER_FRAME = 50;
+const TICKS_PER_FRAME = 20;
 
 // Pure GPU dispatch — no readback, no await. Submits one simulation step.
 function tick() {
@@ -281,9 +332,9 @@ function tick() {
 }
 
 // ================== Run Sims ================
-let isRunning = true;
+let isRunning = false;
 let cycleCount = 0;
-const cycles = 100000;
+const cycles = 50000;
 
 // Called once per display refresh (~60 fps). Runs TICKS_PER_FRAME simulation
 // steps, then does a single GPU→CPU readback for only the data the canvas
@@ -314,12 +365,20 @@ async function renderFrame() {
     0,
     soupBuffer.size,
   );
+  commandEncoder.copyBufferToBuffer(
+    cellBuffer,
+    0,
+    cellStagingBuffer,
+    0,
+    cellBuffer.size,
+  );
   device.queue.submit([commandEncoder.finish()]);
 
   await Promise.all([
     statsStagingBuffer.mapAsync(GPUMapMode.READ),
     ownershipStagingBuffer.mapAsync(GPUMapMode.READ),
     soupStagingBuffer.mapAsync(GPUMapMode.READ),
+    cellStagingBuffer.mapAsync(GPUMapMode.READ),
   ]);
 
   const statsRes = new Int32Array(
@@ -340,11 +399,35 @@ async function renderFrame() {
     100
   ).toFixed(2);
 
+  const cellRes = new Int32Array(
+    cellStagingBuffer.getMappedRange(0, cellBuffer.size).slice(0),
+  );
+
+  // Tally live genome sizes for the histogram
+  sizeCounts.fill(0);
+  for (let i = 0; i < MAX_ORGANISMS; i++) {
+    const off = i * FIELDS_PER_CELL;
+    if (cellRes[off] === 1) {
+      const sz = cellRes[off + 2];
+      if (sz > 0 && sz <= HIST_SIZE_MAX) sizeCounts[sz]++;
+    }
+  }
+
   drawSoup(ownershipRes, soupRes);
+  recordTimelineSample(cycleCount, statsRes[0], statsRes[1]);
+  drawTimeline();
+  drawHistogram();
+
+  // Run the genotype census every CENSUS_INTERVAL frames (uses data already mapped)
+  censusFrameCounter++;
+  if (censusFrameCounter % CENSUS_INTERVAL === 0) {
+    runCensus(cellRes, soupRes);
+  }
 
   statsStagingBuffer.unmap();
   ownershipStagingBuffer.unmap();
   soupStagingBuffer.unmap();
+  cellStagingBuffer.unmap();
 
   if (isRunning) requestAnimationFrame(renderFrame);
 }
@@ -419,8 +502,8 @@ function drawSoup(ownershipData: Int32Array, soupData: Int32Array) {
     if (owner > 0) {
       // 1. Generate base color from owner ID
       // We use prime numbers to spread the colors out
-      r = (owner * 53) % 256;
-      g = (owner * 97) % 256;
+      r = (owner * 53) % 206;
+      g = (owner * 97) % 116;
       b = (owner * 151) % 256;
 
       // 2. Logic to differentiate Instruction vs. Empty Ownership
@@ -456,6 +539,327 @@ function drawSoup(ownershipData: Int32Array, soupData: Int32Array) {
     }
   }
   ctx.putImageData(imageData, 0, 0);
+}
+
+// ============== Population Timeline ===================
+
+const TIMELINE_MAX_SAMPLES = 600; // one per render frame; scrolls as history fills
+
+interface TimelineSample {
+  cycle: number;
+  population: number;
+  memUsed: number;
+}
+const timelineHistory: TimelineSample[] = [];
+
+function recordTimelineSample(
+  cycle: number,
+  population: number,
+  memUsed: number,
+) {
+  timelineHistory.push({ cycle, population, memUsed });
+  if (timelineHistory.length > TIMELINE_MAX_SAMPLES) timelineHistory.shift();
+}
+
+function drawTimeline() {
+  const ctx = timelineCanvas.getContext("2d");
+  if (!ctx || timelineHistory.length < 2) return;
+
+  const W = timelineCanvas.width;
+  const H = timelineCanvas.height;
+  const PAD = { top: 18, bottom: 22, left: 38, right: 10 };
+  const cW = W - PAD.left - PAD.right; // chart area width
+  const cH = H - PAD.top - PAD.bottom; // chart area height
+
+  ctx.fillStyle = "#111";
+  ctx.fillRect(0, 0, W, H);
+
+  // Horizontal grid lines + Y-axis labels (population)
+  ctx.font = "10px monospace";
+  for (let t = 0; t <= 4; t++) {
+    const y = PAD.top + (t / 4) * cH;
+    ctx.strokeStyle = "#2a2a2a";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(PAD.left, y);
+    ctx.lineTo(PAD.left + cW, y);
+    ctx.stroke();
+
+    ctx.fillStyle = "#555";
+    ctx.textAlign = "right";
+    ctx.fillText(
+      String(Math.round(MAX_ORGANISMS * (1 - t / 4))),
+      PAD.left - 4,
+      y + 3,
+    );
+  }
+
+  const n = timelineHistory.length;
+
+  // Memory-used line (orange, normalized 0–1 over SOUP_SIZE)
+  ctx.strokeStyle = "#c84";
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  for (let i = 0; i < n; i++) {
+    const x = PAD.left + (i / (TIMELINE_MAX_SAMPLES - 1)) * cW;
+    const y = PAD.top + cH - (timelineHistory[i].memUsed / SOUP_SIZE) * cH;
+    i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+  }
+  ctx.stroke();
+
+  // Population line (green, normalized 0–1 over MAX_ORGANISMS)
+  ctx.strokeStyle = "#0f0";
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  for (let i = 0; i < n; i++) {
+    const x = PAD.left + (i / (TIMELINE_MAX_SAMPLES - 1)) * cW;
+    const y =
+      PAD.top + cH - (timelineHistory[i].population / MAX_ORGANISMS) * cH;
+    i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+  }
+  ctx.stroke();
+
+  // Legend
+  ctx.textAlign = "left";
+  ctx.fillStyle = "#0f0";
+  ctx.fillText("— population", PAD.left + 4, PAD.top - 4);
+  ctx.fillStyle = "#c84";
+  ctx.fillText("— memory", PAD.left + 110, PAD.top - 4);
+
+  // Cycle stamp (right edge, bottom)
+  const last = timelineHistory[n - 1];
+  ctx.fillStyle = "#444";
+  ctx.textAlign = "right";
+  ctx.fillText(`cycle ${last.cycle}`, W - PAD.right, H - 5);
+}
+
+// ============== Size Distribution Histogram ===================
+
+const HIST_SIZE_MAX = 200; // track genome sizes 1..200
+
+// Counts per genome size — reset and refilled each frame from cellBuffer readback.
+const sizeCounts = new Int32Array(HIST_SIZE_MAX + 1);
+
+function drawHistogram() {
+  const ctx = histogramCanvas.getContext("2d");
+  if (!ctx) return;
+
+  const W = histogramCanvas.width;
+  const H = histogramCanvas.height;
+  const PAD = { top: 18, bottom: 18, left: 38, right: 10 };
+  const cW = W - PAD.left - PAD.right;
+  const cH = H - PAD.top - PAD.bottom;
+
+  ctx.fillStyle = "#111";
+  ctx.fillRect(0, 0, W, H);
+
+  // Find the active size range and peak count
+  let minSize = HIST_SIZE_MAX,
+    maxSize = 0,
+    maxCount = 0;
+  for (let s = 1; s <= HIST_SIZE_MAX; s++) {
+    if (sizeCounts[s] > 0) {
+      if (s < minSize) minSize = s;
+      if (s > maxSize) maxSize = s;
+      if (sizeCounts[s] > maxCount) maxCount = sizeCounts[s];
+    }
+  }
+  if (maxCount === 0) return; // nothing alive yet
+
+  // Widen the visible range by a small margin for readability
+  const rangeStart = Math.max(1, minSize - 5);
+  const rangeEnd = Math.min(HIST_SIZE_MAX, maxSize + 5);
+  const range = rangeEnd - rangeStart + 1;
+  const barW = Math.max(1, Math.floor(cW / range));
+
+  // Horizontal grid + Y-axis labels (count)
+  ctx.font = "10px monospace";
+  for (let t = 0; t <= 4; t++) {
+    const y = PAD.top + (t / 4) * cH;
+    ctx.strokeStyle = "#2a2a2a";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(PAD.left, y);
+    ctx.lineTo(PAD.left + cW, y);
+    ctx.stroke();
+    ctx.fillStyle = "#555";
+    ctx.textAlign = "right";
+    ctx.fillText(
+      String(Math.round(maxCount * (1 - t / 4))),
+      PAD.left - 4,
+      y + 3,
+    );
+  }
+
+  // Bars — same prime-hash color scheme as the soup view
+  for (let s = rangeStart; s <= rangeEnd; s++) {
+    const count = sizeCounts[s];
+    if (count === 0) continue;
+    const x = PAD.left + (s - rangeStart) * barW;
+    const barH = (count / maxCount) * cH;
+    const r = Math.min(255, ((s * 53) % 256) + 50);
+    const g = Math.min(255, ((s * 97) % 256) + 50);
+    const b = Math.min(255, ((s * 151) % 256) + 50);
+    ctx.fillStyle = `rgb(${r},${g},${b})`;
+    ctx.fillRect(x, PAD.top + cH - barH, Math.max(1, barW - 1), barH);
+  }
+
+  // X-axis size labels — show ~8 evenly spaced ticks
+  ctx.fillStyle = "#555";
+  ctx.font = "9px monospace";
+  ctx.textAlign = "center";
+  const step = Math.max(1, Math.ceil(range / 8));
+  for (let s = rangeStart; s <= rangeEnd; s += step) {
+    const x = PAD.left + (s - rangeStart) * barW + barW / 2;
+    ctx.fillText(String(s), x, H - 4);
+  }
+
+  // Chart title
+  ctx.fillStyle = "#444";
+  ctx.textAlign = "left";
+  ctx.font = "10px monospace";
+  ctx.fillText("genome size →", PAD.left + 4, PAD.top - 4);
+}
+
+// ============== Genotype Census + Genebank ===================
+
+const CENSUS_INTERVAL = 50; // run census every N render frames
+const GENEBANK_THRESHOLD = 4; // min peak population to enter the genebank
+
+interface GenotypeRecord {
+  hash: number;
+  size: number;
+  genome: Int32Array; // full instruction sequence
+  firstSeen: number; // cycle number when first observed
+  peakPop: number; // highest simultaneous population ever seen
+  currentPop: number; // population in the most recent census
+  inBank: boolean; // promoted to genebank once peakPop >= threshold
+}
+
+const genotypeMap = new Map<number, GenotypeRecord>();
+const genebank: GenotypeRecord[] = [];
+let censusFrameCounter = 0;
+
+function extractGenome(
+  soupRes: Int32Array,
+  memStart: number,
+  memSize: number,
+): Int32Array {
+  const genome = new Int32Array(memSize);
+  for (let i = 0; i < memSize; i++) {
+    genome[i] = soupRes[(((memStart + i) % SOUP_SIZE) + SOUP_SIZE) % SOUP_SIZE];
+  }
+  return genome;
+}
+
+function hashGenome(genome: Int32Array): number {
+  let h = 2166136261; // FNV-1a offset basis (32-bit)
+  for (let i = 0; i < genome.length; i++) {
+    h ^= genome[i];
+    h = Math.imul(h, 16777619) >>> 0;
+  }
+  return h;
+}
+
+function runCensus(cellRes: Int32Array, soupRes: Int32Array) {
+  // 1. Count each distinct genotype alive right now
+  const currentCounts = new Map<number, number>();
+  const firstSeen = new Map<number, Int32Array>(); // hash → genome (first occurrence)
+
+  for (let i = 0; i < MAX_ORGANISMS; i++) {
+    const off = i * FIELDS_PER_CELL;
+    if (cellRes[off] !== 1) continue; // dead slot
+    const memStart = cellRes[off + 1];
+    const memSize = cellRes[off + 2];
+    if (memSize <= 0 || memSize > HIST_SIZE_MAX) continue;
+
+    const genome = extractGenome(soupRes, memStart, memSize);
+    const hash = hashGenome(genome);
+    currentCounts.set(hash, (currentCounts.get(hash) ?? 0) + 1);
+    if (!firstSeen.has(hash)) firstSeen.set(hash, genome);
+  }
+
+  // 2. Reset currentPop for all tracked records (marks extinct ones as 0)
+  for (const rec of genotypeMap.values()) rec.currentPop = 0;
+
+  // 3. Upsert into genotypeMap, check genebank threshold
+  for (const [hash, count] of currentCounts) {
+    let rec = genotypeMap.get(hash);
+    if (!rec) {
+      const genome = firstSeen.get(hash)!;
+      rec = {
+        hash,
+        size: genome.length,
+        genome,
+        firstSeen: cycleCount,
+        peakPop: count,
+        currentPop: count,
+        inBank: false,
+      };
+      genotypeMap.set(hash, rec);
+    } else {
+      rec.currentPop = count;
+      rec.peakPop = Math.max(rec.peakPop, count);
+    }
+    if (!rec.inBank && rec.peakPop >= GENEBANK_THRESHOLD) {
+      rec.inBank = true;
+      genebank.push(rec);
+    }
+  }
+
+  updateCensusDisplay();
+}
+
+function updateCensusDisplay() {
+  const alive = [...genotypeMap.values()]
+    .filter((r) => r.currentPop > 0)
+    .sort((a, b) => b.currentPop - a.currentPop)
+    .slice(0, 12);
+
+  document.getElementById("stat-genotypes")!.innerText =
+    `${alive.length} live / ${genotypeMap.size} total`;
+  document.getElementById("stat-genebank")!.innerText = String(genebank.length);
+
+  if (alive.length === 0) {
+    document.getElementById("census-list")!.innerHTML = "";
+    return;
+  }
+
+  const maxPop = alive[0].currentPop;
+  const rows = alive.map((r) => {
+    const barLen = Math.round((r.currentPop / maxPop) * 16);
+    const bar = "█".repeat(barLen).padEnd(16, "░");
+    const star = r.inBank ? ' <span style="color:#f80">★</span>' : "";
+    return (
+      `<div>` +
+      `<span style="color:#666">${String(r.size).padStart(3)}</span> ` +
+      `<span style="color:#0a0">${bar}</span> ` +
+      `<span style="color:#aaa">${r.currentPop}</span>` +
+      star +
+      `</div>`
+    );
+  });
+  document.getElementById("census-list")!.innerHTML = rows.join("");
+}
+
+function downloadGenebank() {
+  if (genebank.length === 0) return;
+  const entries = genebank.map((r) => ({
+    hash: r.hash.toString(16).padStart(8, "0"),
+    size: r.size,
+    firstSeen: r.firstSeen,
+    peakPop: r.peakPop,
+    opcodes: Array.from(r.genome).map((op) => OP_NAMES[op] ?? `?${op}`),
+  }));
+  const blob = new Blob([JSON.stringify(entries, null, 2)], {
+    type: "application/json",
+  });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `tierra_genebank_c${cycleCount}.json`;
+  a.click();
+  URL.revokeObjectURL(url);
 }
 
 // ============ Report =================
@@ -536,3 +940,4 @@ document.body.insertAdjacentHTML(
   `<button id="downloadBtn">Download CSV Report</button>`,
 );
 document.getElementById("downloadBtn")!.onclick = () => reporter.download();
+document.getElementById("genebankBtn")!.onclick = downloadGenebank;
