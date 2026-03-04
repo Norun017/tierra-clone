@@ -43,6 +43,32 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
         <button id="genebankBtn" style="font-family:monospace;font-size:10px;background:#333;color:#0f0;border:1px solid #555;padding:1px 5px;cursor:pointer">↓ save</button>
       </p>
       <div id="census-list" style="font-size:11px;line-height:1.6;margin-top:4px"></div>
+      <hr>
+      <h3>Settings</h3>
+      <label style="font-size:11px;cursor:pointer">
+        <input type="checkbox" id="debrisToggle" checked>
+        Organic debris (dead code stays in soup)
+      </label>
+      <hr>
+      <h3>Mutation</h3>
+      <div style="font-size:11px;line-height:2.2">
+        <div><label>Cosmic bit-flip &nbsp;
+          <input type="range" id="cosmicBitSlider" min="0" max="0.0005" step="0.000001" value="0.00005" style="width:90px;vertical-align:middle">
+          <span id="cosmicBitVal">1 in 20,000</span>
+        </label></div>
+        <div><label>Cosmic replace &nbsp;
+          <input type="range" id="cosmicRepSlider" min="0" max="0.0005" step="0.000001" value="0" style="width:90px;vertical-align:middle">
+          <span id="cosmicRepVal">off</span>
+        </label></div>
+        <div><label>Copy bit-flip &nbsp;&nbsp;&nbsp;
+          <input type="range" id="copyBitSlider" min="0" max="0.05" step="0.0001" value="0.001" style="width:90px;vertical-align:middle">
+          <span id="copyBitVal">1 in 1,000</span>
+        </label></div>
+        <div><label>Copy replace &nbsp;&nbsp;&nbsp;
+          <input type="range" id="copyRepSlider" min="0" max="0.05" step="0.0001" value="0" style="width:90px;vertical-align:middle">
+          <span id="copyRepVal">off</span>
+        </label></div>
+      </div>
     </div>
   </div>
   <canvas id="canvas"></canvas>
@@ -113,15 +139,44 @@ const statData = new Uint32Array([1, 80]); // cells_alive, memory_used
 
 // ============== GPU Buffers ==============
 
-const uniformBufferSize = 16;
+const uniformBufferSize = 32;
 const uniformData = new ArrayBuffer(uniformBufferSize);
 const view = new DataView(uniformData);
 view.setInt32(0, SOUP_SIZE, true);
+view.setInt32(4, 1, true); // debris_mode = 1 (on) by default
+view.setUint32(8, 0, true); // cycle (updated each tick)
+view.setUint32(12, 0, true); // _pad
+view.setFloat32(16, 0.00005, true); // cosmic_bit_rate  (≈1 in 20,000)
+view.setFloat32(20, 0.0, true); // cosmic_rep_rate  (off)
+view.setFloat32(24, 0.001, true); // copy_bit_rate    (≈1 in 1,000)
+view.setFloat32(28, 0.0, true); // copy_rep_rate    (off)
 const uniformBuffer = device.createBuffer({
   size: uniformBufferSize,
   usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
 });
 device.queue.writeBuffer(uniformBuffer, 0, uniformData);
+
+function setDebrisMode(on: boolean) {
+  view.setInt32(4, on ? 1 : 0, true);
+  device.queue.writeBuffer(uniformBuffer, 4, uniformData, 4, 4);
+}
+
+function setCosmicBitRate(r: number) {
+  view.setFloat32(16, r, true);
+  device.queue.writeBuffer(uniformBuffer, 16, uniformData, 16, 4);
+}
+function setCosmicRepRate(r: number) {
+  view.setFloat32(20, r, true);
+  device.queue.writeBuffer(uniformBuffer, 20, uniformData, 20, 4);
+}
+function setCopyBitRate(r: number) {
+  view.setFloat32(24, r, true);
+  device.queue.writeBuffer(uniformBuffer, 24, uniformData, 24, 4);
+}
+function setCopyRepRate(r: number) {
+  view.setFloat32(28, r, true);
+  device.queue.writeBuffer(uniformBuffer, 28, uniformData, 28, 4);
+}
 
 const soupBuffer = device.createBuffer({
   size: soup.byteLength,
@@ -258,12 +313,16 @@ const computeBindGroup = device.createBindGroup({
 
 // ============== Simulation Loop ==============
 
-const TICKS_PER_FRAME = 10;
+const TICKS_PER_FRAME = 30;
 let isRunning = false;
 let cycleCount = 0;
-const cycles = 100000;
+const cycles = 1000000;
 
 function tick() {
+  // Write current cycle to uniform so the shader can use it as an RNG seed component
+  view.setUint32(8, cycleCount, true);
+  device.queue.writeBuffer(uniformBuffer, 8, uniformData, 8, 4);
+
   const commandEncoder = device.createCommandEncoder();
   const computePass = commandEncoder.beginComputePass();
   computePass.setPipeline(pipeline);
@@ -394,3 +453,39 @@ document.body.insertAdjacentHTML(
 document.getElementById("downloadBtn")!.onclick = () => reporter.download();
 document.getElementById("genebankBtn")!.onclick = () =>
   downloadGenebank(cycleCount);
+(document.getElementById("debrisToggle") as HTMLInputElement).onchange = (e) =>
+  setDebrisMode((e.target as HTMLInputElement).checked);
+
+function fmtRate(r: number): string {
+  if (r <= 0) return "off";
+  return `1 in ${Math.round(1 / r).toLocaleString()}`;
+}
+
+(document.getElementById("cosmicBitSlider") as HTMLInputElement).oninput = (
+  e,
+) => {
+  const r = parseFloat((e.target as HTMLInputElement).value);
+  setCosmicBitRate(r);
+  document.getElementById("cosmicBitVal")!.innerText = fmtRate(r);
+};
+(document.getElementById("cosmicRepSlider") as HTMLInputElement).oninput = (
+  e,
+) => {
+  const r = parseFloat((e.target as HTMLInputElement).value);
+  setCosmicRepRate(r);
+  document.getElementById("cosmicRepVal")!.innerText = fmtRate(r);
+};
+(document.getElementById("copyBitSlider") as HTMLInputElement).oninput = (
+  e,
+) => {
+  const r = parseFloat((e.target as HTMLInputElement).value);
+  setCopyBitRate(r);
+  document.getElementById("copyBitVal")!.innerText = fmtRate(r);
+};
+(document.getElementById("copyRepSlider") as HTMLInputElement).oninput = (
+  e,
+) => {
+  const r = parseFloat((e.target as HTMLInputElement).value);
+  setCopyRepRate(r);
+  document.getElementById("copyRepVal")!.innerText = fmtRate(r);
+};

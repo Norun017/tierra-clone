@@ -1,5 +1,5 @@
 export const SOUP_SIZE = 60000;
-export const MAX_ORGANISMS = 1024;
+export const MAX_ORGANISMS = 2048;
 export const FIELDS_PER_CELL = 9; // 32 bytes
 export const FIELDS_PER_CPU = 24; // 96 bytes
 export const HIST_SIZE_MAX = 200; // track genome sizes 1..200

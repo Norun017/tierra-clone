@@ -12,7 +12,14 @@ const MOV_THRESHOLD_RATIO: f32 = 0.8;
 
 // ========= STRUCT ===========
 struct Uniform {
-    SOUP_SIZE: i32,
+    SOUP_SIZE:       i32,  // byte 0
+    debris_mode:     i32,  // byte 4  — 1 = leave dead code in soup, 0 = zero it
+    cycle:           u32,  // byte 8  — tick counter written by TypeScript each dispatch
+    _pad:            u32,  // byte 12 — alignment
+    cosmic_bit_rate: f32,  // byte 16 — probability of bit-flip per alive thread per tick
+    cosmic_rep_rate: f32,  // byte 20 — probability of replacement per alive thread per tick
+    copy_bit_rate:   f32,  // byte 24 — probability of bit-flip per mov_iab copy
+    copy_rep_rate:   f32,  // byte 28 — probability of replacement per mov_iab copy
 }
 
 struct GlobalStats {
@@ -203,9 +210,19 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 
             // Check: Do I own the destination? (Either my own body or my daughter's space)
             if (target_owner == my_owner_id) {
-                let instruction = soup[mo(src_addr, uniforms.SOUP_SIZE)];
+                var instruction = soup[mo(src_addr, uniforms.SOUP_SIZE)];
+
+                // Copy mutation: each instruction moved to the daughter may be corrupted
+                let copy_seed = hash_u32(
+                    (cpu_index * 1000003u + uniforms.cycle) ^ u32(src_addr)
+                );
+                instruction = mutate_instruction(
+                    instruction, copy_seed,
+                    uniforms.copy_bit_rate, uniforms.copy_rep_rate
+                );
+
                 soup[mo(dest_addr, uniforms.SOUP_SIZE)] = instruction;
-                
+
                 // As per Tierra C code: track how many instructions were moved to daughter
                 if (dest_addr >= cell.d_start && dest_addr < (cell.d_start + cell.d_size)) {
                     cell.mov_daught += 1;
@@ -256,6 +273,19 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     // 6. Increment IP
     if (!ip_modified) {
         cpu.ip = mo(cpu.ip + 1, SOUP_SIZE);
+    }
+
+    // Cosmic ray — each alive thread independently mutates a random global soup address
+    if (uniforms.cosmic_bit_rate > 0.0 || uniforms.cosmic_rep_rate > 0.0) {
+        let cosmic_seed = hash_u32(cpu_index * 1000003u + uniforms.cycle);
+        let gate = uniforms.cosmic_bit_rate + uniforms.cosmic_rep_rate;
+        if (rand_f32(cosmic_seed ^ 4u) < gate) {
+            let tgt = i32(hash_u32(cosmic_seed ^ 5u) % u32(uniforms.SOUP_SIZE));
+            soup[tgt] = mutate_instruction(
+                soup[tgt], cosmic_seed ^ 6u,
+                uniforms.cosmic_bit_rate, uniforms.cosmic_rep_rate
+            );
+        }
     }
 
     // Save state back to global buffer
@@ -478,22 +508,23 @@ fn reap_check(cpu: ptr<function, VCPU>, cell: ptr<function, Cell>) {
     let congestion = min(1.0, mal_failures / 50.0);
 
     // Fullness pressure: ramps from 0 → 1 across the 50%–100% range
-    let fullness_pressure = select(0.0, (fullness - 0.95) / 0.05, fullness >= 0.95);
+    let fullness_pressure = select(0.0, (fullness - 0.8) / 0.2, fullness >= 0.8);
 
     // Take whichever signal is stronger
     let pressure = max(fullness_pressure, congestion);
+    let sharp_pressure = pow(pressure, 4.0);
 
     if (pressure <= 0.0) { return; }
 
     // Each organism gets a unique base lifespan seeded by its stable mem_start address.
     // This spreads deaths out across time instead of synchronising whole generations.
     let noise = fract(sin(f32((*cell).mem_start) * 127.1 + 43758.5453) * 91371.2);
-    let base_lifespan = mix(8000.0, 1500.0, pressure);
+    let base_lifespan = mix(100000.0, 40000.0, sharp_pressure);
 
     // Errors shorten lifespan — approximates the original queue where bad organisms
     // bubble toward the reaper head. Each error costs 20 age units of lifespan.
-    let error_penalty = f32((*cell).errors) * 20.0;
-    let lifespan = i32(base_lifespan * (0.5 + noise) - error_penalty);
+    let error_penalty = f32((*cell).errors) * 200.0;
+    let lifespan = i32(base_lifespan * (0.8 + noise) - error_penalty);
 
     if ((*cell).age > lifespan) {
         kill_cell(cpu, cell);
@@ -505,13 +536,17 @@ fn kill_cell(cpu: ptr<function, VCPU>, cell: ptr<function, Cell>) {
 
     // 1. Free mother's memory
     for (var i: i32 = 0; i < (*cell).mem_size; i++) {
-        atomicStore(&ownership[mo((*cell).mem_start + i, SOUP_SIZE)], 0);
+        let addr = mo((*cell).mem_start + i, SOUP_SIZE);
+        atomicStore(&ownership[addr], 0);
+        if (uniforms.debris_mode == 0) { soup[addr] = 0; }
     }
 
     // 2. Free daughter's memory if gestation was in progress
     if ((*cell).d_start != -1) {
         for (var j: i32 = 0; j < (*cell).d_size; j++) {
-            atomicStore(&ownership[mo((*cell).d_start + j, SOUP_SIZE)], 0);
+            let addr = mo((*cell).d_start + j, SOUP_SIZE);
+            atomicStore(&ownership[addr], 0);
+            if (uniforms.debris_mode == 0) { soup[addr] = 0; }
         }
         atomicAdd(&stats.memory_used, -(*cell).d_size);
         (*cell).d_start = -1;

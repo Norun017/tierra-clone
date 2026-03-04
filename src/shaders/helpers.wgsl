@@ -136,5 +136,37 @@ fn match_template(
         if (search_b) { b_ptr = mo(b_ptr - 1, soup_size); }
     }
 
-    return -1; // Template not found 
+    return -1; // Template not found
+}
+
+// ========= RNG / Mutation Helpers ===========
+
+// Avalanche hash — fast, good distribution for shader use
+fn hash_u32(x: u32) -> u32 {
+    var v = x;
+    v ^= v >> 17u;
+    v = v * 0xbf324c81u;
+    v ^= v >> 11u;
+    v = v * 0x68b665e5u;
+    v ^= v >> 16u;
+    return v;
+}
+
+// Maps a hash uniformly to [0.0, 1.0)
+fn rand_f32(seed: u32) -> f32 {
+    return f32(hash_u32(seed)) / 4294967296.0;
+}
+
+// Applies bit-flip and/or replacement mutation to one instruction (0–31).
+// base_seed + 0: bit-flip gate, +1: which bit, +2: replace gate, +3: new opcode
+fn mutate_instruction(inst: i32, base_seed: u32, bit_rate: f32, rep_rate: f32) -> i32 {
+    var result = inst;
+    if (rand_f32(base_seed) < bit_rate) {
+        let bit = hash_u32(base_seed + 1u) % 5u;
+        result = (result ^ i32(1u << bit)) & 31;
+    }
+    if (rand_f32(base_seed + 2u) < rep_rate) {
+        result = i32(hash_u32(base_seed + 3u) % 32u);
+    }
+    return result;
 }
