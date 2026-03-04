@@ -7,68 +7,12 @@ import {
 } from "./constants";
 
 // Canvas references — set once via initMonitor()
-let monitorCanvas: HTMLCanvasElement;
 let timelineCanvas: HTMLCanvasElement;
 let histogramCanvas: HTMLCanvasElement;
 
-export function initMonitor(
-  mc: HTMLCanvasElement,
-  tc: HTMLCanvasElement,
-  hc: HTMLCanvasElement,
-) {
-  monitorCanvas = mc;
+export function initMonitor(tc: HTMLCanvasElement, hc: HTMLCanvasElement) {
   timelineCanvas = tc;
   histogramCanvas = hc;
-}
-
-// ============== Soup Visualization ===================
-
-export function drawSoup(ownershipData: Int32Array, soupData: Int32Array) {
-  const ctx = monitorCanvas.getContext("2d");
-  if (!ctx) return;
-
-  const width = monitorCanvas.width;
-  const height = monitorCanvas.height;
-  const imageData = ctx.createImageData(width, height);
-  const pixelsPerAddr = (width * height) / SOUP_SIZE;
-
-  for (let i = 0; i < SOUP_SIZE; i++) {
-    const owner = ownershipData[i];
-    const instruction = soupData[i];
-
-    let r = 0,
-      g = 0,
-      b = 0;
-
-    if (owner > 0) {
-      r = (owner * 53) % 86;
-      g = (owner * 97) % 126;
-      b = (owner * 151) % 256;
-
-      if (instruction === 0) {
-        r = Math.floor(r * 0.2);
-        g = Math.floor(g * 0.2);
-        b = Math.floor(b * 0.2);
-      } else {
-        r = Math.min(255, r + 50);
-        g = Math.min(255, g + 50);
-        b = Math.min(255, b + 50);
-      }
-    } else if (instruction !== 0) {
-      r = 40;
-      g = 40;
-      b = 40;
-    }
-
-    for (let p = 0; p < pixelsPerAddr; p++) {
-      const pixelIndex = (i * pixelsPerAddr + p) * 4;
-      imageData.data[pixelIndex + 0] = r;
-      imageData.data[pixelIndex + 1] = g;
-      imageData.data[pixelIndex + 2] = b;
-      imageData.data[pixelIndex + 3] = 255;
-    }
-  }
-  ctx.putImageData(imageData, 0, 0);
 }
 
 // ============== Population Timeline ===================
@@ -254,7 +198,7 @@ export function drawHistogram() {
 // ============== Genotype Census + Genebank ===================
 
 const CENSUS_INTERVAL = 50;
-const GENEBANK_THRESHOLD = 4;
+const GENEBANK_THRESHOLD = 10;
 
 interface GenotypeRecord {
   hash: number;
@@ -344,9 +288,7 @@ function runCensus(
 function updateCensusDisplay() {
   const alive = [...genotypeMap.values()]
     .filter((r) => r.currentPop > 0)
-    .sort((a, b) => b.currentPop - a.currentPop)
-    .slice(0, 12);
-
+    .sort((a, b) => b.currentPop - a.currentPop);
   document.getElementById("stat-genotypes")!.innerText =
     `${alive.length} live / ${genotypeMap.size} total`;
   document.getElementById("stat-genebank")!.innerText = String(genebank.length);
@@ -357,7 +299,7 @@ function updateCensusDisplay() {
   }
 
   const maxPop = alive[0].currentPop;
-  const rows = alive.map((r) => {
+  const rows = alive.slice(0, 12).map((r) => {
     const barLen = Math.round((r.currentPop / maxPop) * 16);
     const bar = "█".repeat(barLen).padEnd(16, "░");
     const star = r.inBank ? ' <span style="color:#f80">★</span>' : "";
@@ -393,14 +335,21 @@ export function downloadGenebank(cycleCount: number) {
   URL.revokeObjectURL(url);
 }
 
-// Called every render frame — runs census on its own interval
+// Returns true if the NEXT tickCensus call will run the census.
+// Use this to decide whether to do an expensive soup readback before calling tickCensus.
+export function willRunCensus(): boolean {
+  return (censusFrameCounter + 1) % CENSUS_INTERVAL === 0;
+}
+
+// Called every render frame — runs census on its own interval.
+// soupRes may be null on non-census frames (pass null to skip census this tick).
 export function tickCensus(
   cellRes: Int32Array,
-  soupRes: Int32Array,
+  soupRes: Int32Array | null,
   cycleCount: number,
 ) {
   censusFrameCounter++;
-  if (censusFrameCounter % CENSUS_INTERVAL === 0) {
+  if (censusFrameCounter % CENSUS_INTERVAL === 0 && soupRes !== null) {
     runCensus(cellRes, soupRes, cycleCount);
   }
 }

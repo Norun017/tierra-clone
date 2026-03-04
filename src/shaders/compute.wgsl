@@ -20,6 +20,8 @@ struct Uniform {
     cosmic_rep_rate: f32,  // byte 20 — probability of replacement per alive thread per tick
     copy_bit_rate:   f32,  // byte 24 — probability of bit-flip per mov_iab copy
     copy_rep_rate:   f32,  // byte 28 — probability of replacement per mov_iab copy
+    canvas_width:    u32,  // byte 32
+    canvas_height:   u32,  // byte 36
 }
 
 struct GlobalStats {

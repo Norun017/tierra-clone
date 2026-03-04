@@ -1,5 +1,6 @@
 import "./style.css";
 import computeWGSL from "./shaders/compute.wgsl";
+import soupRenderWGSL from "./shaders/soup_render.wgsl";
 import {
   SOUP_SIZE,
   MAX_ORGANISMS,
@@ -9,12 +10,12 @@ import {
 } from "./constants";
 import {
   initMonitor,
-  drawSoup,
   recordTimelineSample,
   drawTimeline,
   tallySizes,
   drawHistogram,
   tickCensus,
+  willRunCensus,
   downloadGenebank,
 } from "./monitor";
 
@@ -23,25 +24,22 @@ import {
 document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
   <div style="display: flex; gap: 20px; font-family: monospace; background: #222; color: #0f0; padding: 20px;">
     <div style="display: flex; flex-direction: column; gap: 10px;">
-      <canvas id="monitor" width="600" height="600" style="border: 1px solid #555;"></canvas>
-      <canvas id="timeline" width="600" height="150" style="border: 1px solid #555;"></canvas>
-      <canvas id="histogram" width="600" height="120" style="border: 1px solid #555;"></canvas>
+      <canvas id="monitor" width="800" height="600" style="border: 1px solid #555;"></canvas>
+      <canvas id="timeline" width="600" height="100" style="border: 1px solid #555;"></canvas>
+      <canvas id="histogram" width="600" height="80" style="border: 1px solid #555;"></canvas>
     </div>
     <div id="dashboard">
       <h2>TIERRA MONITOR</h2>
       <p>Cycle: <span id="stat-cycle">0</span></p>
-      <p>Population: <span id="stat-pop">0</span> / 1024</p>
-      <p>Memory Usage: <span id="stat-mem">0</span> / 60000</p>
+      <p>Population: <span id="stat-pop">0</span> / ${MAX_ORGANISMS}</p>
+      <p>Memory Usage: <span id="stat-mem">0</span> / ${SOUP_SIZE}</p>
       <p>Fullness: <span id="stat-full">0</span>%</p>
-      <hr>
-      <h3>Top Organisms</h3>
-      <div id="cell-list"></div>
-      <hr>
-      <h3>Genotype Census</h3>
+      <h3>Genotypes</h3>
       <p style="font-size:11px">Live/Total: <span id="stat-genotypes">—</span></p>
       <p style="font-size:11px">Genebank: <span id="stat-genebank">0</span>
         <button id="genebankBtn" style="font-family:monospace;font-size:10px;background:#333;color:#0f0;border:1px solid #555;padding:1px 5px;cursor:pointer">↓ save</button>
       </p>
+      <p style="font-size:11px">Top 12 Genotypes</p>
       <div id="census-list" style="font-size:11px;line-height:1.6;margin-top:4px"></div>
       <hr>
       <h3>Settings</h3>
@@ -71,16 +69,12 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
       </div>
     </div>
   </div>
-  <canvas id="canvas"></canvas>
 `;
 
 initMonitor(
-  document.querySelector<HTMLCanvasElement>("#monitor")!,
   document.querySelector<HTMLCanvasElement>("#timeline")!,
   document.querySelector<HTMLCanvasElement>("#histogram")!,
 );
-
-const canvas = document.querySelector<HTMLCanvasElement>("#canvas");
 
 // ============== WebGPU Setup ==============
 
@@ -92,8 +86,11 @@ if (!adapter) throw new Error("No appropriate GPU adapter found.");
 const device = await adapter.requestDevice();
 if (!device) throw new Error("Failed to create WebGPU device.");
 
-const context = canvas?.getContext("webgpu");
-if (!context) throw new Error("WebGPU context could not be initialized.");
+// Configure the monitor canvas as the WebGPU render target for soup visualization.
+const monitorCanvas = document.querySelector<HTMLCanvasElement>("#monitor")!;
+const monitorContext = monitorCanvas.getContext("webgpu")!;
+const presentationFormat = navigator.gpu.getPreferredCanvasFormat();
+monitorContext.configure({ device, format: presentationFormat });
 
 // ============== Soup / CPU / Cell Data ==============
 
@@ -139,7 +136,7 @@ const statData = new Uint32Array([1, 80]); // cells_alive, memory_used
 
 // ============== GPU Buffers ==============
 
-const uniformBufferSize = 32;
+const uniformBufferSize = 48;
 const uniformData = new ArrayBuffer(uniformBufferSize);
 const view = new DataView(uniformData);
 view.setInt32(0, SOUP_SIZE, true);
@@ -150,6 +147,8 @@ view.setFloat32(16, 0.00005, true); // cosmic_bit_rate  (≈1 in 20,000)
 view.setFloat32(20, 0.0, true); // cosmic_rep_rate  (off)
 view.setFloat32(24, 0.001, true); // copy_bit_rate    (≈1 in 1,000)
 view.setFloat32(28, 0.0, true); // copy_rep_rate    (off)
+view.setUint32(32, monitorCanvas.width, true);
+view.setUint32(36, monitorCanvas.height, true);
 const uniformBuffer = device.createBuffer({
   size: uniformBufferSize,
   usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
@@ -232,10 +231,8 @@ const statsStagingBuffer = device.createBuffer({
   size: 16,
   usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
 });
-const ownershipStagingBuffer = device.createBuffer({
-  size: ownership.byteLength,
-  usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
-});
+// soupStagingBuffer is only read on census frames (every 50 frames) for genotype census.
+// Soup visualization is handled entirely on GPU via the render pipeline.
 const soupStagingBuffer = device.createBuffer({
   size: soupBuffer.size,
   usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
@@ -311,10 +308,35 @@ const computeBindGroup = device.createBindGroup({
   ],
 });
 
+// ============== Soup Render Pipeline ==============
+
+const soupRenderPipeline = device.createRenderPipeline({
+  layout: "auto",
+  vertex: {
+    module: device.createShaderModule({ code: soupRenderWGSL }),
+    entryPoint: "vs_main",
+  },
+  fragment: {
+    module: device.createShaderModule({ code: soupRenderWGSL }),
+    entryPoint: "fs_main",
+    targets: [{ format: presentationFormat }],
+  },
+  primitive: { topology: "triangle-list" },
+});
+
+const soupRenderBindGroup = device.createBindGroup({
+  layout: soupRenderPipeline.getBindGroupLayout(0),
+  entries: [
+    { binding: 0, resource: { buffer: uniformBuffer } },
+    { binding: 1, resource: { buffer: soupBuffer } },
+    { binding: 2, resource: { buffer: ownershipBuffer } },
+  ],
+});
+
 // ============== Simulation Loop ==============
 
-const TICKS_PER_FRAME = 30;
-let isRunning = false;
+const TICKS_PER_FRAME = 10;
+let isRunning = true;
 let cycleCount = 0;
 const cycles = 1000000;
 
@@ -339,22 +361,12 @@ async function renderFrame() {
   for (let i = 0; i < TICKS_PER_FRAME && cycleCount < cycles; i++) tick();
   if (cycleCount >= cycles) isRunning = false;
 
+  // Only read soup back to CPU on census frames (every 50 frames).
+  // All other frames, soup visualization is handled entirely on the GPU.
+  const doSoupReadback = willRunCensus();
+
   const commandEncoder = device.createCommandEncoder();
   commandEncoder.copyBufferToBuffer(statsBuffer, 0, statsStagingBuffer, 0, 16);
-  commandEncoder.copyBufferToBuffer(
-    ownershipBuffer,
-    0,
-    ownershipStagingBuffer,
-    0,
-    ownershipBuffer.size,
-  );
-  commandEncoder.copyBufferToBuffer(
-    soupBuffer,
-    0,
-    soupStagingBuffer,
-    0,
-    soupBuffer.size,
-  );
   commandEncoder.copyBufferToBuffer(
     cellBuffer,
     0,
@@ -362,27 +374,52 @@ async function renderFrame() {
     0,
     cellBuffer.size,
   );
+  if (doSoupReadback) {
+    commandEncoder.copyBufferToBuffer(
+      soupBuffer,
+      0,
+      soupStagingBuffer,
+      0,
+      soupBuffer.size,
+    );
+  }
+
+  // GPU render pass: draws soup directly from GPU buffers — no CPU pixel loop.
+  const renderPass = commandEncoder.beginRenderPass({
+    colorAttachments: [
+      {
+        view: monitorContext.getCurrentTexture().createView(),
+        clearValue: { r: 0, g: 0, b: 0, a: 1 },
+        loadOp: "clear",
+        storeOp: "store",
+      },
+    ],
+  });
+  renderPass.setPipeline(soupRenderPipeline);
+  renderPass.setBindGroup(0, soupRenderBindGroup);
+  renderPass.draw(6);
+  renderPass.end();
+
   device.queue.submit([commandEncoder.finish()]);
 
-  await Promise.all([
+  const toMap: Promise<void>[] = [
     statsStagingBuffer.mapAsync(GPUMapMode.READ),
-    ownershipStagingBuffer.mapAsync(GPUMapMode.READ),
-    soupStagingBuffer.mapAsync(GPUMapMode.READ),
     cellStagingBuffer.mapAsync(GPUMapMode.READ),
-  ]);
+  ];
+  if (doSoupReadback) toMap.push(soupStagingBuffer.mapAsync(GPUMapMode.READ));
+  await Promise.all(toMap);
 
   const statsRes = new Int32Array(
     statsStagingBuffer.getMappedRange(0, statsBuffer.size).slice(0),
   );
-  const ownershipRes = new Int32Array(
-    ownershipStagingBuffer.getMappedRange(0, ownershipBuffer.size).slice(0),
-  );
-  const soupRes = new Int32Array(
-    soupStagingBuffer.getMappedRange(0, soupBuffer.size).slice(0),
-  );
   const cellRes = new Int32Array(
     cellStagingBuffer.getMappedRange(0, cellBuffer.size).slice(0),
   );
+  const soupRes: Int32Array | null = doSoupReadback
+    ? new Int32Array(
+        soupStagingBuffer.getMappedRange(0, soupBuffer.size).slice(0),
+      )
+    : null;
 
   document.getElementById("stat-cycle")!.innerText = cycleCount.toString();
   document.getElementById("stat-pop")!.innerText = statsRes[0].toString();
@@ -393,16 +430,14 @@ async function renderFrame() {
   ).toFixed(2);
 
   tallySizes(cellRes);
-  drawSoup(ownershipRes, soupRes);
   recordTimelineSample(cycleCount, statsRes[0], statsRes[1]);
   drawTimeline();
   drawHistogram();
   tickCensus(cellRes, soupRes, cycleCount);
 
   statsStagingBuffer.unmap();
-  ownershipStagingBuffer.unmap();
-  soupStagingBuffer.unmap();
   cellStagingBuffer.unmap();
+  if (doSoupReadback) soupStagingBuffer.unmap();
 
   if (isRunning) requestAnimationFrame(renderFrame);
 }
@@ -446,11 +481,11 @@ const reporter = new SimulationReport();
 
 // ============== Buttons ==============
 
-document.body.insertAdjacentHTML(
+/* document.body.insertAdjacentHTML(
   "beforeend",
   `<button id="downloadBtn">Download CSV Report</button>`,
-);
-document.getElementById("downloadBtn")!.onclick = () => reporter.download();
+); */
+/* document.getElementById("downloadBtn")!.onclick = () => reporter.download(); */
 document.getElementById("genebankBtn")!.onclick = () =>
   downloadGenebank(cycleCount);
 (document.getElementById("debrisToggle") as HTMLInputElement).onchange = (e) =>
