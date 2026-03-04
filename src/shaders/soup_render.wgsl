@@ -15,9 +15,10 @@ struct Uniform {
     canvas_height:   u32,  // byte 36
 };
 
-@group(0) @binding(0) var<uniform>       uniforms  : Uniform;
-@group(0) @binding(1) var<storage, read> soup      : array<i32>;
-@group(0) @binding(2) var<storage, read> ownership : array<i32>;
+@group(0) @binding(0) var<uniform>       uniforms     : Uniform;
+@group(0) @binding(1) var<storage, read> soup         : array<i32>;
+@group(0) @binding(2) var<storage, read> ownership    : array<i32>;
+@group(0) @binding(3) var<storage, read> cpu_markers  : array<i32>;
 
 // Full-screen quad: two triangles covering NDC [-1,1]×[-1,1].
 @vertex
@@ -64,6 +65,46 @@ fn fs_main(@builtin(position) pos: vec4f) -> @location(0) vec4f {
         r = 40.0 / 255.0;
         g = 40.0 / 255.0;
         b = 40.0 / 255.0;
+    }
+
+    // ── CPU triangle indicator ──────────────────────────────────────────────
+    // Triangle shape (points DOWN toward the CPU's instruction pointer):
+    //   █████  ← base, 5px wide  (2 display rows above the CPU's address)
+    //    ███   ← mid,  3px wide  (1 display row above)
+    //     █    ← tip,  1px wide  (at the exact CPU address)
+    //
+    // addrs_per_row = SOUP_SIZE / canvas_height = 60000 / 600 = 100.
+    // subpx: signed sub-pixel offset from the center of the current address strip.
+    let addrs_per_row = uniforms.SOUP_SIZE / i32(uniforms.canvas_height);
+    let subpx = i32(pixel_idx % pixels_per_addr) - i32(pixels_per_addr / 2u);
+
+    // For each triangle level, we look up whether any CPU sits in the address
+    // that is 0, 1, or 2 display rows below the current pixel's row.
+    var tri_cell = 0;
+
+    // Base (current pixel is 2 rows above some CPU)
+    let base_addr = addr + 2 * addrs_per_row;
+    if (abs(subpx) <= 2 && base_addr < uniforms.SOUP_SIZE) {
+        let m = cpu_markers[base_addr];
+        if (m > 0) { tri_cell = m; }
+    }
+    // Middle (current pixel is 1 row above some CPU) — overrides base
+    let mid_addr = addr + addrs_per_row;
+    if (abs(subpx) <= 1 && mid_addr < uniforms.SOUP_SIZE) {
+        let m = cpu_markers[mid_addr];
+        if (m > 0) { tri_cell = m; }
+    }
+    // Tip (current pixel IS the CPU's address) — overrides middle
+    if (subpx == 0) {
+        let m = cpu_markers[addr];
+        if (m > 0) { tri_cell = m; }
+    }
+
+    if (tri_cell > 0) {
+        // Match the organism's color scheme but push it to near-white brightness.
+        r = min(1.0, f32((tri_cell * 53) % 86)  / 255.0 + 0.7);
+        g = min(1.0, f32((tri_cell * 97) % 126) / 255.0 + 0.7);
+        b = min(1.0, f32((tri_cell * 151) % 256)/ 255.0 + 0.7);
     }
 
     return vec4f(r, g, b, 1.0);

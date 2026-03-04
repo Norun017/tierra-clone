@@ -1,6 +1,7 @@
 import "./style.css";
 import computeWGSL from "./shaders/compute.wgsl";
 import soupRenderWGSL from "./shaders/soup_render.wgsl";
+import markCpusWGSL from "./shaders/mark_cpus.wgsl";
 import {
   SOUP_SIZE,
   MAX_ORGANISMS,
@@ -22,8 +23,12 @@ import {
 // ============== UI ==============
 
 document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
-  <div style="display: flex; gap: 20px; font-family: monospace; background: #222; color: #0f0; padding: 20px;">
+<div style="font-family: monospace; background: #222; color: #0f0; padding: 0; margin: 0;">
+  <h1 style ="padding: 0; margin: 0; text-align: left;">TIERRA CLONE</h1>  
+</div>
+<div style="display: flex; gap: 20px; font-family: monospace; background: #222; color: #0f0; padding: 20px;">
     <div style="display: flex; flex-direction: column; gap: 10px;">
+      
       <canvas id="monitor" width="800" height="600" style="border: 1px solid #555;"></canvas>
       <canvas id="timeline" width="600" height="100" style="border: 1px solid #555;"></canvas>
       <canvas id="histogram" width="600" height="80" style="border: 1px solid #555;"></canvas>
@@ -46,6 +51,10 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
       <label style="font-size:11px;cursor:pointer">
         <input type="checkbox" id="debrisToggle" checked>
         Organic debris (dead code stays in soup)
+      </label><br>
+      <label style="font-size:11px;cursor:pointer">
+        <input type="checkbox" id="cpuMarkersToggle">
+        Show CPU pointers
       </label>
       <hr>
       <h3>Mutation</h3>
@@ -242,6 +251,14 @@ const cellStagingBuffer = device.createBuffer({
   usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
 });
 
+// CPU marker buffer: one i32 per soup address.
+// Cleared before each render pass, then filled by the markCpus compute pre-pass.
+// Value: 0 = no CPU here, >0 = cell_index+1 of the CPU whose IP is at that address.
+const cpuMarkerBuffer = device.createBuffer({
+  size: SOUP_SIZE * 4,
+  usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+});
+
 // ============== Pipeline ==============
 
 const bindGroupLayout = device.createBindGroupLayout({
@@ -330,12 +347,34 @@ const soupRenderBindGroup = device.createBindGroup({
     { binding: 0, resource: { buffer: uniformBuffer } },
     { binding: 1, resource: { buffer: soupBuffer } },
     { binding: 2, resource: { buffer: ownershipBuffer } },
+    { binding: 3, resource: { buffer: cpuMarkerBuffer } },
+  ],
+});
+
+// ============== CPU Mark Pre-pass Pipeline ==============
+// Tiny compute pass that runs just before rendering: writes each alive CPU's
+// cell_index+1 into cpuMarkerBuffer at its IP address for the render shader to read.
+
+const markCpusPipeline = device.createComputePipeline({
+  layout: "auto",
+  compute: {
+    module: device.createShaderModule({ code: markCpusWGSL }),
+    entryPoint: "mark_cpus",
+  },
+});
+
+const markCpusBindGroup = device.createBindGroup({
+  layout: markCpusPipeline.getBindGroupLayout(0),
+  entries: [
+    { binding: 0, resource: { buffer: uniformBuffer } },
+    { binding: 1, resource: { buffer: cpuBuffer } },
+    { binding: 2, resource: { buffer: cpuMarkerBuffer } },
   ],
 });
 
 // ============== Simulation Loop ==============
 
-const TICKS_PER_FRAME = 10;
+const TICKS_PER_FRAME = 30;
 let isRunning = true;
 let cycleCount = 0;
 const cycles = 1000000;
@@ -382,6 +421,17 @@ async function renderFrame() {
       0,
       soupBuffer.size,
     );
+  }
+
+  // Clear cpu_markers (always, so toggling off immediately removes all triangles).
+  // Only dispatch the mark pass when the CPU pointer overlay is enabled.
+  commandEncoder.clearBuffer(cpuMarkerBuffer);
+  if (showCpuMarkers) {
+    const markPass = commandEncoder.beginComputePass();
+    markPass.setPipeline(markCpusPipeline);
+    markPass.setBindGroup(0, markCpusBindGroup);
+    markPass.dispatchWorkgroups(Math.ceil(MAX_ORGANISMS / 64));
+    markPass.end();
   }
 
   // GPU render pass: draws soup directly from GPU buffers — no CPU pixel loop.
@@ -490,6 +540,13 @@ document.getElementById("genebankBtn")!.onclick = () =>
   downloadGenebank(cycleCount);
 (document.getElementById("debrisToggle") as HTMLInputElement).onchange = (e) =>
   setDebrisMode((e.target as HTMLInputElement).checked);
+
+let showCpuMarkers = false;
+(document.getElementById("cpuMarkersToggle") as HTMLInputElement).onchange = (
+  e,
+) => {
+  showCpuMarkers = (e.target as HTMLInputElement).checked;
+};
 
 function fmtRate(r: number): string {
   if (r <= 0) return "off";
