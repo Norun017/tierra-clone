@@ -18,6 +18,7 @@ struct Uniform {
 struct GlobalStats {
     cells_alive: atomic<i32>,
     memory_used: atomic<i32>, // Total bytes currently 'mal'-ed
+    mal_failures: atomic<i32>, // Pending failed mal() calls (no space found)
 }
 
 // 9 fields = 48 bytes
@@ -339,23 +340,43 @@ fn mal(cpu: ptr<function, VCPU>, cell: ptr<function, Cell>) {
     }
 
     // --- 3. ALLOCATION ---
+    // CAS every address in the block (not just the first). If any address was
+    // stolen by a concurrent thread between our scan and our store, roll back
+    // all already-claimed addresses so memory_used stays accurate.
     if (found_addr != -1) {
+        var claim_ok = true;
         for (var k: i32 = 1; k < requested_size; k++) {
-            atomicStore(&ownership[mo(found_addr + k, SOUP_SIZE)], my_owner_id);
+            let addr = mo(found_addr + k, SOUP_SIZE);
+            let cas = atomicCompareExchangeWeak(&ownership[addr], 0, my_owner_id);
+            if (!cas.exchanged) {
+                // Collision — roll back all addresses claimed so far
+                atomicStore(&ownership[mo(found_addr, SOUP_SIZE)], 0);
+                for (var r: i32 = 1; r < k; r++) {
+                    atomicStore(&ownership[mo(found_addr + r, SOUP_SIZE)], 0);
+                }
+                claim_ok = false;
+                break;
+            }
         }
-        
-        (*cpu).registers[0] = found_addr; // AX = Address of daughter
-        (*cell).d_start = found_addr;     // Track daughter in cell
-        (*cell).d_size = requested_size;
-        (*cpu).flags[0] = 0;              // Success! Clear error flag
 
-        atomicAdd(&stats.memory_used, requested_size); 
+        if (claim_ok) {
+            (*cpu).registers[0] = found_addr;
+            (*cell).d_start = found_addr;
+            (*cell).d_size = requested_size;
+            (*cpu).flags[0] = 0; // Success
+            atomicAdd(&stats.memory_used, requested_size);
+        } else {
+            (*cpu).flags[0] = 1; // Collision, retry next cycle
+        }
     } else {
         // Rule: If request is valid but no space found, 
         // normally Tierra invokes the Reaper. In our GPU setup, 
         // the Reaper is running in parallel and will eventually 
-        // clear space. For now, we set the error flag.
-        (*cpu).flags[0] = 1; 
+        // No contiguous space found — signal congestion so the reaper activates
+        // even if reported fullness hasn't crossed the threshold yet.
+        // This mirrors original Tierra: failed mal → reaper invoked immediately.
+        atomicAdd(&stats.mal_failures, 1);
+        (*cpu).flags[0] = 1;
     }
 }
 
@@ -446,23 +467,36 @@ fn divide(cpu: ptr<function, VCPU>, cell: ptr<function, Cell>) {
 
 // ========= Reaper mech ============
 fn reap_check(cpu: ptr<function, VCPU>, cell: ptr<function, Cell>) {
-    let SOUP_SIZE = uniforms.SOUP_SIZE;
     let mem_used = f32(atomicLoad(&stats.memory_used));
-    let fullness = mem_used / f32(SOUP_SIZE);
+    let fullness = mem_used / f32(uniforms.SOUP_SIZE);
 
-    // Only activate Reaper if soup is > 80% full
-    if (fullness > 0.90) {
-        // Calculate death score with a touch of randomness (using IP as a seed)
-        let noise = i32(fract(sin(f32((*cpu).ip)) * 43758.5453) * 50.0);
-        let death_score = (*cell).age + ((*cell).errors * 10) + noise;
+    // Congestion pressure: counts unresolved mal() failures (no space found).
+    // 50 blocked mals = full pressure, regardless of reported fullness.
+    // This breaks the fragmentation deadlock when the soup is below the threshold
+    // yet too fragmented for any new allocation to succeed.
+    let mal_failures = f32(atomicLoad(&stats.mal_failures));
+    let congestion = min(1.0, mal_failures / 50.0);
 
-        // The more full the soup, the lower the 'death_threshold' becomes
-        // This creates "pressure"
-        let death_threshold = 3000 - i32(fullness * 1000.0);
+    // Fullness pressure: ramps from 0 → 1 across the 50%–100% range
+    let fullness_pressure = select(0.0, (fullness - 0.95) / 0.05, fullness >= 0.95);
 
-        if (death_score > death_threshold) {
-            kill_cell(cpu, cell);
-        }
+    // Take whichever signal is stronger
+    let pressure = max(fullness_pressure, congestion);
+
+    if (pressure <= 0.0) { return; }
+
+    // Each organism gets a unique base lifespan seeded by its stable mem_start address.
+    // This spreads deaths out across time instead of synchronising whole generations.
+    let noise = fract(sin(f32((*cell).mem_start) * 127.1 + 43758.5453) * 91371.2);
+    let base_lifespan = mix(8000.0, 1500.0, pressure);
+
+    // Errors shorten lifespan — approximates the original queue where bad organisms
+    // bubble toward the reaper head. Each error costs 20 age units of lifespan.
+    let error_penalty = f32((*cell).errors) * 20.0;
+    let lifespan = i32(base_lifespan * (0.5 + noise) - error_penalty);
+
+    if ((*cell).age > lifespan) {
+        kill_cell(cpu, cell);
     }
 }
 
@@ -485,9 +519,11 @@ fn kill_cell(cpu: ptr<function, VCPU>, cell: ptr<function, Cell>) {
         (*cell).mov_daught = 0;
     }
 
-    // 3. Decrement global stats
+    // 3. Decrement global stats; each death fulfils one pending mal failure
     atomicAdd(&stats.cells_alive, -1);
     atomicAdd(&stats.memory_used, -(*cell).mem_size);
+    let pending = atomicLoad(&stats.mal_failures);
+    if (pending > 0) { atomicAdd(&stats.mal_failures, -1); }
 
     // 4. Release cell slot lock and set state to Dead
     atomicStore(&cell_locks[u32((*cpu).cell_index)], 0);
