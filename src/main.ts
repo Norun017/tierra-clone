@@ -23,7 +23,7 @@ import {
 
 document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
 <div style="font-family: monospace; background: #222; color: #0f0; padding: 0; margin: 0;">
-  <h1 style ="padding: 0; margin: 0; text-align: left;">TIERRA CLONE</h1>  
+  <h1 style ="padding: 0; margin: 0; text-align: left;">TIERRA - Artificial Life</h1>  
 </div>
 <div style="display: flex; gap: 20px; font-family: monospace; background: #222; color: #0f0; padding: 20px;">
     <div style="display: flex; flex-direction: column; gap: 10px;">
@@ -34,6 +34,7 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
     </div>
     <div id="dashboard">
       <h2>TIERRA MONITOR</h2>
+      <button id="startStopBtn" style="font-family:monospace;font-size:13px;background:#333;color:#0f0;border:1px solid #555;padding:4px 12px;cursor:pointer;margin-bottom:8px">▶ Start</button>
       <p>Cycle: <span id="stat-cycle">0</span></p>
       <p>Population: <span id="stat-pop">0</span> / ${MAX_ORGANISMS}</p>
       <p>Memory Usage: <span id="stat-mem">0</span> / ${SOUP_SIZE}</p>
@@ -67,11 +68,11 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
           <span id="cosmicRepVal">off</span>
         </label></div>
         <div><label>Copy bit-flip &nbsp;&nbsp;&nbsp;
-          <input type="range" id="copyBitSlider" min="0" max="0.05" step="0.0001" value="0.001" style="width:90px;vertical-align:middle">
+          <input type="range" id="copyBitSlider" min="0" max="0.005" step="0.0001" value="0.001" style="width:90px;vertical-align:middle">
           <span id="copyBitVal">1 in 1,000</span>
         </label></div>
         <div><label>Copy replace &nbsp;&nbsp;&nbsp;
-          <input type="range" id="copyRepSlider" min="0" max="0.05" step="0.0001" value="0" style="width:90px;vertical-align:middle">
+          <input type="range" id="copyRepSlider" min="0" max="0.005" step="0.0001" value="0" style="width:90px;vertical-align:middle">
           <span id="copyRepVal">off</span>
         </label></div>
       </div>
@@ -374,8 +375,17 @@ const markCpusBindGroup = device.createBindGroup({
 // ============== Simulation Loop ==============
 
 const TICKS_PER_FRAME = 30;
-let isRunning = true;
+let isRunning = false;
 let cycleCount = 0;
+
+const startStopBtn = document.getElementById(
+  "startStopBtn",
+) as HTMLButtonElement;
+startStopBtn.onclick = () => {
+  isRunning = !isRunning;
+  startStopBtn.textContent = isRunning ? "⏸ Pause" : "▶ Start";
+  if (isRunning) requestAnimationFrame(renderFrame);
+};
 const cycles = 1000000;
 
 function tick() {
